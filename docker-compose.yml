@@ -1,0 +1,19 @@
+services:
+  clock-diagnosis:
+    build: .
+    image: clock-constraint-diagnosis:latest
+    container_name: clock-constraint-diagnosis
+    ports:
+      # 宿主机端口:容器端口；默认对外 8000
+      - "${PORT:-8000}:8000"
+    environment:
+      # 容器内监听地址/端口（一般无需修改）
+      HOST: "0.0.0.0"
+      PORT: "8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
