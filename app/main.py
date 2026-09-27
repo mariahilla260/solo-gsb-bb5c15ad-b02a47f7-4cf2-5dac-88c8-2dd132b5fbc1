@@ -1,10 +1,14 @@
-"""FastAPI 入口：单条诊断、批量诊断、修复建议与健康检查。"""
+"""FastAPI 入口：单条诊断、批量诊断、修复建议、校准方案、事件窗口峰值与健康检查。"""
 
 from __future__ import annotations
 
+import math
 from typing import List
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from .models import (
     BatchDiagnosisRequest,
@@ -18,14 +22,19 @@ from .models import (
     DiagnosisResponse,
     FeasibleDiagnosis,
     InfeasibleDiagnosis,
+    NodeOffset,
     RepairRequest,
     RepairResponse,
+    WindowPeakRequest,
+    WindowPeakResponse,
     collect_nodes,
 )
 from .solver import (
     CalibrationCandidate,
     Observation,
+    WindowEvent,
     diagnose,
+    peak_window_events,
     plan_calibration,
     suggest_repair,
 )
@@ -38,10 +47,38 @@ app = FastAPI(
         "可行时给出相对参考节点的最紧上下界及对应的证据链"
         "（lower_proof / upper_proof），不可行时返回稳定的矛盾环，"
         "并可进一步给出最小观测删除集合的修复建议；"
-        "还可从带成本的候选观测中规划满足目标界宽的最小成本校准方案。"
+        "还可从带成本的候选观测中规划满足目标界宽的最小成本校准方案；"
+        "亦可对带本地时间戳的事件求解同一组可行偏移下可同时落入"
+        "目标窗口的最大事件集合（窗口峰值），并给出见证偏移。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
+
+
+def _sanitize_error_value(value):
+    """把校验错误详情中的非有限浮点替换为字符串。
+
+    请求体携带 NaN / Infinity 时，默认错误处理器会把原值放进 422 响应体，
+    而它们不是合法 JSON，会导致序列化崩溃（500）。替换为字符串后，
+    非法输入始终稳定返回 422。
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, dict):
+        return {k: _sanitize_error_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_error_value(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _sanitize_error_value(jsonable_encoder(exc.errors()))},
+    )
 
 
 def _to_observation(raw) -> Observation:
@@ -243,4 +280,57 @@ def diagnose_calibration_plan(request: CalibrationPlanRequest) -> CalibrationPla
         selected_observation_ids=selected_ids,
         total_cost=total_cost,
         diagnosis=_diagnosis_model(request.name, final_result),
+    )
+
+
+@app.post(
+    "/api/v1/events/window-peak",
+    response_model=WindowPeakResponse,
+    tags=["events"],
+)
+def events_window_peak(request: WindowPeakRequest) -> WindowPeakResponse:
+    """窗口峰值：求同一组可行偏移下可同时落入窗口的最大事件集合。
+
+    真实时间 = 本地时间戳 - 节点偏移，参考节点偏移为 0。基础观测本身矛盾时
+    直接回传现有矛盾环（status=base_contradiction）；否则返回最大事件数、
+    并列时排序后 ID 序列字典序最小的选择，以及一组覆盖全部节点的可行偏移
+    （见证中入窗事件恰为所选集合）。
+    """
+    observations = [_to_observation(o) for o in request.observations]
+    # 事件节点并入求解节点集（effective_nodes 已包含事件节点）。
+    nodes = request.effective_nodes()
+
+    base_result = diagnose(
+        nodes=nodes,
+        reference=request.reference,
+        observations=observations,
+    )
+    if not base_result["feasible"]:
+        return WindowPeakResponse(
+            name=request.name,
+            status="base_contradiction",
+            count=0,
+            selected_event_ids=[],
+            offsets=None,
+            diagnosis=_diagnosis_model(request.name, base_result),
+        )
+
+    selected_ids, offsets = peak_window_events(
+        nodes=nodes,
+        reference=request.reference,
+        observations=observations,
+        events=[
+            WindowEvent(id=e.id, node=e.node, timestamp=e.timestamp)
+            for e in request.events
+        ],
+        window_start=request.window.start,
+        window_end=request.window.end,
+    )
+    return WindowPeakResponse(
+        name=request.name,
+        status="optimal",
+        count=len(selected_ids),
+        selected_event_ids=selected_ids,
+        offsets=[NodeOffset(node=n, offset=o) for n, o in offsets],
+        diagnosis=None,
     )

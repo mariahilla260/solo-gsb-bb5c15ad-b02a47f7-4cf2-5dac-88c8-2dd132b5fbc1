@@ -15,7 +15,11 @@
 5. **校准方案**：基础观测可行时，从至多 12 条带非负整数成本的候选校准观测中，
    选择使各目标节点相对参考节点的界宽达标的**总成本最小子集**
    （同成本先比条数、再比 ID 序列字典序），返回选中 ID、总成本与加入后的诊断；
-6. 提供 **批量诊断接口**，结果按提交下标稳定返回。
+6. **事件窗口峰值**：对至多 12 条带本地时间戳的事件，在**满足全部观测的同一组
+   偏移**下（真实时间 = 本地时间戳 − 节点偏移，参考节点偏移为 0），求可同时落入
+   目标窗口 `[start, end]` 的**最大事件集合**（并列时取排序后 ID 序列字典序最小者），
+   返回数量、所选 ID 及一组覆盖全部节点的**见证偏移**（其中入窗事件恰为所选集合）；
+7. 提供 **批量诊断接口**，结果按提交下标稳定返回。
 
 算法：差分约束图 + Bellman-Ford（超源初始化检测负环、前驱指针回卷提取矛盾环），
 纯 Python 标准实现，无外部服务依赖。
@@ -494,6 +498,138 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/calibration-plan \
 }
 ```
 
+### `POST /api/v1/events/window-peak` — 事件窗口峰值
+
+在诊断请求的基础上另给**至多 12 条事件**（各自带唯一 ID、发生节点、有限本地
+时间戳）和一个**有限闭区间** `[start, end]`。定义 **真实时间 = 本地时间戳 −
+节点偏移**，**参考节点偏移为 0**；服务在**满足全部观测的同一组偏移**下，求可
+同时落入窗口的**最大事件数**，并给出一组覆盖全部节点的可行偏移作为见证。
+
+请求体沿用单条诊断的全部字段（`reference` / `observations` / `nodes` / `name`），
+另增加：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `events` | array | 否 | 事件列表，至多 12 条，默认空数组 |
+| `events[].id` | string | 是 | 事件唯一 ID（事件间不可重复） |
+| `events[].node` | string | 是 | 事件发生的时钟节点（自动并入求解节点集） |
+| `events[].timestamp` | number | 是 | 节点本地时间戳（毫秒），须为有限数值 |
+| `window` | object | 是 | 目标窗口 |
+| `window.start` | number | 是 | 窗口下界（毫秒），须有限且 ≤ `end` |
+| `window.end` | number | 是 | 窗口上界（毫秒），须为有限数值 |
+
+语义：事件 `i` 入窗 ⟺ `start ≤ timestamp_i − x_node ≤ end`，其中 `x` 是满足全部
+观测且 `x_reference = 0` 的偏移赋值。这等价于一对挂在参考节点上的差分约束
+（`x_node − x_reference ≤ timestamp_i − start` 且 `x_reference − x_node ≤
+end − timestamp_i`），因此一个事件子集「可同时入窗」当且仅当把对应约束加入基础
+观测后系统仍可行。服务按 **事件数最大 → 排序后事件 ID 序列字典序最小** 唯一
+确定所选集合。
+
+响应字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `status` | string | `optimal` / `base_contradiction` |
+| `count` | integer | 可同时入窗的最大事件数；`base_contradiction` 时为 0 |
+| `selected_event_ids` | string[] | 选中事件 ID（字典序）；`base_contradiction` 时为空 |
+| `offsets` | array/null | 见证：覆盖**全部节点**（显式 `nodes` ∪ `reference` ∪ 观测端点 ∪ 事件节点）的一组可行偏移，按节点字典序；`base_contradiction` 时为 `null` |
+| `offsets[].node` / `offsets[].offset` | - | 节点与其时钟偏移（毫秒），参考节点恒为 0 |
+| `diagnosis` | object/null | `base_contradiction` 时为基础观测的矛盾诊断（与单条诊断一致的矛盾环）；`optimal` 时为 `null` |
+
+保证：
+
+- **见证性质**：`offsets` 满足全部观测、参考节点偏移为 0，且按它计算的真实时间
+  使**入窗事件恰为** `selected_event_ids`（最大性保证未选中事件必然落在窗外）；
+- **空事件**：`events` 为空时 `count=0`、`selected_event_ids` 为空，
+  `offsets` 仍给出一组覆盖全部节点的可行偏移；
+- **基础矛盾**：基础观测本身矛盾时不做事件求解，直接以
+  `status="base_contradiction"` 回传现有矛盾环。
+
+#### 共享时钟约束导致事件不能同时入窗（示例）
+
+观测 `skew` 锁定 `x_C − x_B ∈ [0, 10]`。事件 `e1`（节点 B，本地时间 100）入窗
+`[95, 105]` 要求 `x_B ∈ [−5, 5]`；事件 `e2`（节点 C，本地时间 0）入窗要求
+`x_C ∈ [−105, −95]`。但约束要求 `x_C ≥ x_B ≥ −5`，与 `x_C ≤ −95` 冲突——两个
+事件各自都能入窗，**同一组偏移下却不能同时入窗**，故最大为 1；并列的 `{e1}` 与
+`{e2}` 中取 ID 字典序最小的 `e1`：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/events/window-peak \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "skew", "source": "B", "target": "C", "min": 0, "max": 10}
+    ],
+    "events": [
+      {"id": "e1", "node": "B", "timestamp": 100},
+      {"id": "e2", "node": "C", "timestamp": 0}
+    ],
+    "window": {"start": 95, "end": 105}
+  }'
+```
+
+```json
+{
+  "name": null,
+  "status": "optimal",
+  "count": 1,
+  "selected_event_ids": ["e1"],
+  "offsets": [
+    {"node": "A", "offset": 0.0},
+    {"node": "B", "offset": 0.0},
+    {"node": "C", "offset": 0.0}
+  ],
+  "diagnosis": null
+}
+```
+
+见证中 `e1` 的真实时间为 `100 − 0 = 100 ∈ [95, 105]`，而 `e2` 为 `0 − 0 = 0`，
+落在窗外——入窗事件恰为所选集合。
+
+#### 基础矛盾（示例）
+
+基础观测已构成矛盾环时直接回传，`status="base_contradiction"`（`diagnosis`
+结构与单条诊断的不可行响应完全一致）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/events/window-peak \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+      {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4}
+    ],
+    "events": [{"id": "e1", "node": "A", "timestamp": 1}],
+    "window": {"start": 0, "end": 5}
+  }'
+```
+
+```json
+{
+  "name": null,
+  "status": "base_contradiction",
+  "count": 0,
+  "selected_event_ids": [],
+  "offsets": null,
+  "diagnosis": {
+    "feasible": false,
+    "name": null,
+    "cycle": {
+      "steps": [
+        {"observation_id": "o2", "from": "A", "to": "B",
+         "constraint": "lower", "weight": -3.0, "bound": 3.0},
+        {"observation_id": "o1", "from": "B", "to": "A",
+         "constraint": "lower", "weight": 0.0, "bound": 0.0}
+      ],
+      "accumulated_bound": -3.0,
+      "contradiction": "0 <= -3.0"
+    }
+  }
+}
+```
+
 ### `POST /api/v1/diagnose/batch` — 批量诊断
 
 请求体 `{"diagnoses": [ <单条请求>, ... ]}`（至少 1 条）。每条可带 `name`，
@@ -522,7 +658,9 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/batch \
 非法区间（`min > max`）、重复观测 ID、`reference` 不在 `nodes` 中等请求问题返回
 HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` 为空或目标重复、
 `max_width < 0`、候选超过 12 条、候选成本为负或非整数、候选 ID 彼此重复或与
-基础观测 ID 冲突、候选区间非法等。
+基础观测 ID 冲突、候选区间非法等。窗口峰值接口还会拒绝：事件超过 12 条、事件 ID
+重复、事件 ID / 节点为空、时间戳非有限数值（NaN / Infinity）、窗口缺失、
+`start > end` 或窗口端点非有限数值等。
 
 ---
 
@@ -544,7 +682,13 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
   集合即唯一修复建议；删除全部观测必然可行，因此上限不小于观测总数时必有解；
 - **校准**：候选至多 12 条，穷举至多 2^12 = 4096 个子集；每个子集先做负环
   检测（矛盾组合不可选），可行时再跑双向最短路核对各目标界宽；按
-  (总成本, 条数, ID 序列字典序) 比较，答案与候选提交顺序无关。
+  (总成本, 条数, ID 序列字典序) 比较，答案与候选提交顺序无关；
+- **窗口峰值**：事件 `i` 入窗 ⟺ `x_node − x_reference ∈ [t_i − end, t_i − start]`
+  （参考节点偏移为 0），即一对挂在参考节点上的差分约束边；子集可行 ⟺ 加入对应
+  边后无负环，且可行性随子集单调。按规模从大到小、同规模按排序后 ID 序列字典序
+  枚举，首个可行子集即唯一答案（事件至多 12 条，最坏枚举 2^12 个子集）。见证
+  偏移用 Fraction 精确求势（零初始化 Bellman-Ford 可行势）后整体平移使参考节点
+  为 0，边界收紧的事件在实数意义下严格入窗，输出前仅做一次 float 舍入。
 
 结果顺序的确定性保证：
 
@@ -559,9 +703,9 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
 
 ```
 app/
-  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/health
+  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/api/v1/events/window-peak、/health
   models.py    # 请求/响应 Pydantic 模型与入参校验
-  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准方案
+  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准方案、事件窗口峰值与见证偏移构造
 tests/         # 算法层与 HTTP 接口测试
 Dockerfile
 docker-compose.yml

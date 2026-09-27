@@ -49,12 +49,29 @@
 校准观测中选子集：组合必须保持系统可行（含矛盾的组合不可选），且使各
 目标节点相对参考节点的上下界均有限、宽度不超过给定上限。答案按
 (总成本, 条数, ID 序列字典序) 唯一确定。
+
+事件窗口峰值
+------------
+``peak_window_events`` 处理带本地时间戳的事件：事件 i 的真实时间定义为
+``t_i - x_node``（参考节点偏移为 0），落入窗口 ``[start, end]`` 等价于
+一对挂在参考节点上的差分约束::
+
+    x_node - x_reference <= t_i - start   ->  边 reference -> node，权 t_i - start
+    x_reference - x_node <= end - t_i     ->  边 node -> reference，权 end - t_i
+
+因此一个事件子集「可同时入窗」当且仅当把对应边加入基础观测后系统仍可行
+（无负环）。可行性随子集单调（子集可行则其任意子集可行），按规模从大到小、
+同规模按排序后 ID 序列字典序枚举，首个可行子集即唯一答案。见证偏移用
+Fraction 精确求势（零初始化 Bellman-Ford），整体平移使参考节点偏移为 0；
+由于答案已最大，任何满足选中集合的可行赋值自动使未选中事件落在窗外，
+即见证中入窗事件恰为所选集合。
 """
 
 from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import List, Optional, Sequence, Tuple
 
 
@@ -84,6 +101,15 @@ class CalibrationCandidate(Observation):
     """一条带成本的候选校准观测：成本为非负整数。"""
 
     cost: int = 0
+
+
+@dataclass(frozen=True)
+class WindowEvent:
+    """一条事件：节点 node 在本地时间戳 timestamp（毫秒）发生。"""
+
+    id: str
+    node: str
+    timestamp: float
 
 
 def _norm(value: float) -> float:
@@ -597,3 +623,145 @@ def plan_calibration(
         return None
     _, _, ids, chosen = best
     return ids, best[0], chosen
+
+
+# ---------------------------------------------------------------------------
+# 事件窗口峰值
+# ---------------------------------------------------------------------------
+
+
+def _event_window_edges(
+    event: WindowEvent, reference: str, window_start: float, window_end: float
+) -> Tuple[Edge, Edge]:
+    """把单个事件的入窗条件展开为一对挂在参考节点上的差分约束边。
+
+    真实时间 = 本地时间戳 - 节点偏移，且参考节点偏移为 0，因此
+    ``start <= t - x_node <= end`` 等价于::
+
+        x_node - x_reference <= t - start   (上界边 reference -> node)
+        x_reference - x_node <= end - t     (下界边 node -> reference)
+    """
+    upper = _norm(event.timestamp - window_start)
+    lower = _norm(window_end - event.timestamp)
+    return (
+        Edge(
+            u=reference,
+            v=event.node,
+            weight=upper,
+            observation_id=event.id,
+            kind="upper",
+            bound=_norm(window_start),
+        ),
+        Edge(
+            u=event.node,
+            v=reference,
+            weight=lower,
+            observation_id=event.id,
+            kind="lower",
+            bound=_norm(window_end),
+        ),
+    )
+
+
+def _witness_offsets(
+    nodes: Sequence[str],
+    reference: str,
+    observations: Sequence[Observation],
+    selected_events: Sequence[WindowEvent],
+    window_start: float,
+    window_end: float,
+) -> List[Tuple[str, float]]:
+    """为可行系统构造一组见证偏移：覆盖 nodes，参考节点偏移为 0。
+
+    约束（基础观测 + 选中事件的入窗约束）用 Fraction 精确求势：零初始化
+    Bellman-Ford 收敛后，dist 对每条约束边满足 ``dist[v] <= dist[u] + w``
+    （虚拟零源使孤立节点取 0）；再整体平移使参考节点偏移为 0——差分约束
+    对平移不变，而入窗约束锚定参考节点，平移后恰为 ``x_node ∈ [t-end,
+    t-start]``。精确算术保证被收紧到边界的事件（真实时间恰等于窗口端点）
+    在实数意义下严格入窗；输出前仅做一次 float 舍入。
+    """
+    constraints: List[Tuple[str, str, Fraction]] = []
+    for obs in observations:
+        constraints.append((obs.source, obs.target, Fraction(obs.max)))
+        constraints.append((obs.target, obs.source, Fraction(-obs.min)))
+    for ev in selected_events:
+        constraints.append(
+            (reference, ev.node, Fraction(ev.timestamp) - Fraction(window_start))
+        )
+        constraints.append(
+            (ev.node, reference, Fraction(window_end) - Fraction(ev.timestamp))
+        )
+
+    dist = {v: Fraction(0) for v in nodes}
+    for _ in range(len(nodes)):
+        updated = False
+        for u, v, w in constraints:
+            nd = dist[u] + w
+            if nd < dist[v]:
+                dist[v] = nd
+                updated = True
+        if not updated:
+            break
+
+    shift = dist[reference]
+    return [(v, _norm(float(dist[v] - shift))) for v in nodes]
+
+
+def peak_window_events(
+    nodes: Sequence[str],
+    reference: str,
+    observations: Sequence[Observation],
+    events: Sequence[WindowEvent],
+    window_start: float,
+    window_end: float,
+) -> Tuple[List[str], List[Tuple[str, float]]]:
+    """求同一组可行偏移下可同时落入窗口的最大事件子集及一组见证偏移。
+
+    调用方须保证基础观测本身可行。事件节点并入求解节点集；返回
+    ``(selected_ids, offsets)``：
+
+    * ``selected_ids``：选中事件 ID（字典序）。在满足全部观测且参考节点
+      偏移为 0 的同一组偏移下，可同时入窗的事件数达到最大；并列时取排序后
+      ID 序列字典序最小者。空事件列表返回空选择（数量 0）。
+    * ``offsets``：覆盖全部节点（``nodes`` ∪ 参考节点 ∪ 事件节点）的
+      ``(节点, 偏移)`` 列表，按节点字典序。该组偏移满足全部观测、参考节点
+      偏移为 0，且入窗事件恰为选中集合（最大性保证未选中事件必然在窗外）。
+    """
+    ordered_events = sorted(events, key=lambda e: e.id)
+    all_nodes = sorted(set(nodes) | {reference} | {e.node for e in ordered_events})
+    base_edges = _build_edges(observations)
+    edges_by_id = {
+        e.id: _event_window_edges(e, reference, window_start, window_end)
+        for e in ordered_events
+    }
+
+    def subset_feasible(ids: Tuple[str, ...]) -> bool:
+        edges = list(base_edges)
+        for eid in ids:
+            edges.extend(edges_by_id[eid])
+        return _extract_negative_cycle(edges, all_nodes) is None
+
+    # 可行性随子集单调（子集可行则其任意子集可行），故按规模从大到小、
+    # 同规模按排序后 ID 序列字典序枚举，首个可行子集即唯一答案；
+    # 事件至多 12 条，最坏枚举 2^12 = 4096 个子集。
+    ids = [e.id for e in ordered_events]
+    selected: Tuple[str, ...] = ()
+    for k in range(len(ids), 0, -1):
+        hit = next(
+            (c for c in itertools.combinations(ids, k) if subset_feasible(c)),
+            None,
+        )
+        if hit is not None:
+            selected = hit
+            break
+
+    chosen = {e.id: e for e in ordered_events}
+    offsets = _witness_offsets(
+        nodes=all_nodes,
+        reference=reference,
+        observations=observations,
+        selected_events=[chosen[eid] for eid in selected],
+        window_start=window_start,
+        window_end=window_end,
+    )
+    return list(selected), offsets

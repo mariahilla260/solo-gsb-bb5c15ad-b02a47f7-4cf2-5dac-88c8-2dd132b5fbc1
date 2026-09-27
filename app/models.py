@@ -320,3 +320,113 @@ class CalibrationPlanResponse(BaseModel):
         description="optimal 时为加入所选观测后的诊断；"
         "base_contradiction 时为基础观测的矛盾诊断；no_solution 时为 null",
     )
+
+
+class WindowEventIn(BaseModel):
+    """一条事件：节点 node 在本地时间戳 timestamp（毫秒）发生。"""
+
+    id: str = Field(..., min_length=1, description="事件的唯一 ID")
+    node: str = Field(..., min_length=1, description="事件发生的时钟节点")
+    timestamp: float = Field(..., description="节点本地时间戳（毫秒），须为有限数值")
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _check(self) -> "WindowEventIn":
+        if not math.isfinite(self.timestamp):
+            raise ValueError("timestamp 必须为有限数值")
+        return self
+
+
+class WindowIn(BaseModel):
+    """有限闭区间 [start, end]（真实时间，毫秒）。"""
+
+    start: float = Field(..., description="窗口下界（毫秒），须为有限数值")
+    end: float = Field(..., description="窗口上界（毫秒），须为有限数值")
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _check(self) -> "WindowIn":
+        if not math.isfinite(self.start) or not math.isfinite(self.end):
+            raise ValueError("start/end 必须为有限数值")
+        if self.start > self.end:
+            raise ValueError(
+                f"窗口非法：start({self.start}) > end({self.end})"
+            )
+        return self
+
+
+class WindowPeakRequest(DiagnosisRequest):
+    """窗口峰值请求：沿用诊断字段，另给至多 12 条事件与目标窗口。"""
+
+    events: List[WindowEventIn] = Field(
+        default_factory=list,
+        max_length=12,
+        description="至多 12 条事件（唯一 ID、节点、有限本地时间戳）",
+    )
+    window: WindowIn = Field(
+        ..., description="有限闭区间 [start, end]（真实时间，毫秒）"
+    )
+
+    @model_validator(mode="after")
+    def _check(self) -> "WindowPeakRequest":
+        # 复用基础诊断的全部校验（reference∈nodes、观测 ID 唯一等）。
+        DiagnosisRequest._check(self)
+
+        ids = [e.id for e in self.events]
+        if len(ids) != len(set(ids)):
+            raise ValueError("events 中存在重复的事件 ID")
+        return self
+
+    def effective_nodes(self) -> List[str]:
+        """合并显式节点、观测端点、参考节点与事件节点。
+
+        事件节点即纳入求解节点集（等价于在 nodes 中显式声明）。
+        """
+        nodes = set(super().effective_nodes())
+        nodes.update(e.node for e in self.events)
+        return sorted(nodes)
+
+
+class NodeOffset(BaseModel):
+    """见证偏移中的一个节点条目。"""
+
+    node: str
+    offset: float = Field(
+        ..., description="该节点的时钟偏移（毫秒）；参考节点偏移为 0"
+    )
+
+
+class WindowPeakResponse(BaseModel):
+    """窗口峰值响应。
+
+    * ``status="optimal"``：``count`` 为可同时入窗的最大事件数，
+      ``selected_event_ids`` 为并列最大时排序后 ID 序列字典序最小的选择，
+      ``offsets`` 为一组覆盖全部节点的可行偏移（见证：满足全部观测、参考
+      节点偏移为 0，且入窗事件恰为所选集合）；
+    * ``status="base_contradiction"``：基础观测本身矛盾，``diagnosis``
+      回传与单条诊断一致的矛盾环，``count=0``、其余结果字段为空 / null。
+    """
+
+    name: Optional[str] = None
+    status: Literal["optimal", "base_contradiction"] = Field(
+        ..., description="求解状态"
+    )
+    count: int = Field(
+        ..., description="可同时入窗的最大事件数；base_contradiction 时为 0"
+    )
+    selected_event_ids: List[str] = Field(
+        ..., description="选中事件 ID（按字典序）；base_contradiction 时为空列表"
+    )
+    offsets: Optional[List[NodeOffset]] = Field(
+        ...,
+        description="覆盖全部节点的一组可行偏移（按节点字典序）；"
+        "base_contradiction 时为 null",
+    )
+    diagnosis: Optional[Union[FeasibleDiagnosis, InfeasibleDiagnosis]] = Field(
+        ...,
+        discriminator="feasible",
+        description="base_contradiction 时为基础观测的矛盾诊断（含矛盾环）；"
+        "optimal 时为 null",
+    )

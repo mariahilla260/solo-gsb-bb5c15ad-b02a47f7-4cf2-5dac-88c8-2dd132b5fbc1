@@ -5,7 +5,9 @@ import itertools
 from app.solver import (
     CalibrationCandidate,
     Observation,
+    WindowEvent,
     diagnose,
+    peak_window_events,
     plan_calibration,
     suggest_repair,
 )
@@ -551,3 +553,142 @@ def test_calibration_independent_of_submission_order():
     for plan in plans[1:]:
         assert (plan[0], plan[1]) == (plans[0][0], plans[0][1])
     assert plans[0][0] == ["cal-b", "cal-c"]
+
+
+# ---------------------------------------------------------------------------
+# 事件窗口峰值
+# ---------------------------------------------------------------------------
+
+
+def _ev(id_, node, timestamp):
+    return WindowEvent(id=id_, node=node, timestamp=timestamp)
+
+
+def _check_witness(nodes, reference, observations, events, window, selected, offsets):
+    """见证偏移的通用校验：覆盖全部节点、参考节点为 0、满足全部观测、
+    且入窗事件恰为所选集合（精确比较）。"""
+    start, end = window
+    offsets = dict(offsets)
+    expected_nodes = set(nodes) | {reference} | {e.node for e in events}
+    assert set(offsets) == expected_nodes
+    assert offsets[reference] == 0.0
+    for obs in observations:
+        assert obs.min <= offsets[obs.target] - offsets[obs.source] <= obs.max
+    chosen = set(selected)
+    for ev in events:
+        in_window = start <= ev.timestamp - offsets[ev.node] <= end
+        assert in_window == (ev.id in chosen)
+
+
+def test_window_peak_all_events_fit():
+    selected, offsets = peak_window_events(
+        nodes=["A", "B"],
+        reference="A",
+        observations=[_obs("o1", "A", "B", 0, 10)],
+        events=[_ev("e1", "A", 100), _ev("e2", "B", 105)],
+        window_start=95,
+        window_end=110,
+    )
+    assert selected == ["e1", "e2"]
+    _check_witness(["A", "B"], "A", [_obs("o1", "A", "B", 0, 10)],
+                   [_ev("e1", "A", 100), _ev("e2", "B", 105)], (95, 110),
+                   selected, offsets)
+
+
+def test_window_peak_shared_constraint_blocks_joint():
+    # x_C - x_B ∈ [0,10]：e1 入窗要求 x_B ∈ [-5,5]，e2 入窗要求 x_C ∈ [-105,-95]，
+    # 二者不能同时成立 -> 最大为 1，并列取字典序最小的 ["e1"]
+    obs = [_obs("skew", "B", "C", 0, 10)]
+    events = [_ev("e1", "B", 100), _ev("e2", "C", 0)]
+    selected, offsets = peak_window_events(
+        nodes=["A"], reference="A", observations=obs, events=events,
+        window_start=95, window_end=105,
+    )
+    assert selected == ["e1"]
+    _check_witness(["A"], "A", obs, events, (95, 105), selected, offsets)
+
+
+def test_window_peak_tie_break_lexicographic():
+    # x_C - x_B = 10：e1@B 与 e2@C 至多入窗一个；e3@A 恒入窗。
+    # 最大为 2：{e1,e3} 与 {e2,e3} 并列，取字典序最小 ["e1","e3"]
+    obs = [_obs("skew", "B", "C", 10, 10)]
+    events = [_ev("e1", "B", 0), _ev("e2", "C", 0), _ev("e3", "A", 1)]
+    selected, offsets = peak_window_events(
+        nodes=["A"], reference="A", observations=obs, events=events,
+        window_start=0, window_end=5,
+    )
+    assert selected == ["e1", "e3"]
+    _check_witness(["A"], "A", obs, events, (0, 5), selected, offsets)
+
+
+def test_window_peak_empty_events_returns_zero():
+    obs = [_obs("o1", "A", "B", 1, 5)]
+    selected, offsets = peak_window_events(
+        nodes=["A", "B"], reference="A", observations=obs, events=[],
+        window_start=0, window_end=10,
+    )
+    assert selected == []
+    _check_witness(["A", "B"], "A", obs, [], (0, 10), selected, offsets)
+
+
+def test_window_peak_event_nodes_merged_into_offsets():
+    # Z 仅作为事件节点出现，也必须出现在见证偏移中
+    selected, offsets = peak_window_events(
+        nodes=["A", "B"],
+        reference="A",
+        observations=[_obs("o1", "A", "B", 0, 1)],
+        events=[_ev("e1", "Z", 3)],
+        window_start=0,
+        window_end=5,
+    )
+    assert selected == ["e1"]
+    assert [n for n, _ in offsets] == ["A", "B", "Z"]
+
+
+def test_window_peak_tight_window_boundary_exact():
+    # 窗口 [5,5] 迫使 x_B = 5：边界事件必须精确入窗
+    obs = [_obs("o1", "A", "B", 0, 100)]
+    events = [_ev("e1", "B", 10)]
+    selected, offsets = peak_window_events(
+        nodes=["A", "B"], reference="A", observations=obs, events=events,
+        window_start=5, window_end=5,
+    )
+    assert selected == ["e1"]
+    _check_witness(["A", "B"], "A", obs, events, (5, 5), selected, offsets)
+
+
+def test_window_peak_none_fit_returns_empty_selection():
+    # 参考节点上的事件真实时间恒为 100，窗口 [0,5] 容纳不下
+    selected, offsets = peak_window_events(
+        nodes=["A"], reference="A", observations=[],
+        events=[_ev("e1", "A", 100)], window_start=0, window_end=5,
+    )
+    assert selected == []
+    _check_witness(["A"], "A", [], [_ev("e1", "A", 100)], (0, 5), selected, offsets)
+
+
+def test_window_peak_same_node_conflicting_events():
+    # 同节点两事件时间戳相距 100，窗口宽 10：至多入窗一个
+    events = [_ev("e1", "B", 0), _ev("e2", "B", 100)]
+    selected, offsets = peak_window_events(
+        nodes=["A", "B"], reference="A", observations=[], events=events,
+        window_start=0, window_end=10,
+    )
+    assert selected == ["e1"]
+    _check_witness(["A", "B"], "A", [], events, (0, 10), selected, offsets)
+
+
+def test_window_peak_independent_of_submission_order():
+    obs = [_obs("skew", "B", "C", 0, 10)]
+    events = [_ev("e1", "B", 100), _ev("e2", "C", 0), _ev("e3", "A", 100)]
+    results = [
+        peak_window_events(
+            nodes=["A"], reference="A", observations=obs, events=list(perm),
+            window_start=95, window_end=105,
+        )
+        for perm in itertools.permutations(events)
+    ]
+    for selected, offsets in results[1:]:
+        assert selected == results[0][0]
+        assert offsets == results[0][1]
+    assert results[0][0] == ["e1", "e3"]
