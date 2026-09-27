@@ -770,3 +770,266 @@ def test_calibration_plan_candidate_connects_new_target():
     assert data["total_cost"] == 4
     bounds = {b["node"]: b for b in data["diagnosis"]["node_bounds"]}
     assert bounds["C"]["lower"] == 1.0 and bounds["C"]["upper"] == 3.0
+
+
+# ---------------------------------------------------------------------------
+# 窗口峰值
+# ---------------------------------------------------------------------------
+
+
+def _window_payload(**overrides):
+    payload = {
+        "reference": "A",
+        "observations": [
+            {"id": "sync", "source": "A", "target": "B", "min": 0, "max": 100}
+        ],
+        "events": [
+            {"id": "e1", "node": "B", "timestamp": 1000},
+            {"id": "e2", "node": "B", "timestamp": 1010},
+        ],
+        "window": {"start": 990, "end": 995},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_window_peak_all_events_fit():
+    payload = _window_payload(
+        events=[
+            {"id": "e1", "node": "B", "timestamp": 1000},
+            {"id": "e2", "node": "B", "timestamp": 1003},
+        ]
+    )
+    resp = client.post("/api/v1/events/window-peak", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["max_in_window"] == 2
+    assert data["selected_event_ids"] == ["e1", "e2"]
+    assert data["diagnosis"] is None
+    offsets = {o["node"]: o["offset"] for o in data["offsets"]}
+    assert offsets["A"] == 0.0
+    assert 990 <= 1000 - offsets["B"] <= 995
+    assert 990 <= 1003 - offsets["B"] <= 995
+
+
+def test_window_peak_shared_clock_cannot_cooccur():
+    # 两条事件共享同一时钟偏移 x_B，不能同时入窗；并列时选 ID 字典序最小者
+    resp = client.post("/api/v1/events/window-peak", json=_window_payload())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["max_in_window"] == 1
+    assert data["selected_event_ids"] == ["e1"]
+    offsets = {o["node"]: o["offset"] for o in data["offsets"]}
+    assert 990 <= 1000 - offsets["B"] <= 995
+    assert not (990 <= 1010 - offsets["B"] <= 995)
+
+
+def test_window_peak_witness_in_window_exactly_selected():
+    # 三事件两两可同窗、三者不可同窗；见证中入窗事件须恰为所选集合
+    payload = _window_payload(
+        events=[
+            {"id": "e3", "node": "B", "timestamp": 1010},
+            {"id": "e1", "node": "B", "timestamp": 1000},
+            {"id": "e2", "node": "B", "timestamp": 1005},
+        ],
+        window={"start": 990, "end": 997},
+    )
+    data = client.post("/api/v1/events/window-peak", json=payload).json()
+    assert data["max_in_window"] == 2
+    assert data["selected_event_ids"] == ["e1", "e2"]
+    offsets = {o["node"]: o["offset"] for o in data["offsets"]}
+    in_window = [
+        e["id"]
+        for e in payload["events"]
+        if 990 <= e["timestamp"] - offsets["B"] <= 997
+    ]
+    assert in_window == ["e1", "e2"]
+
+
+def test_window_peak_result_independent_of_event_order():
+    events = [
+        {"id": "e1", "node": "B", "timestamp": 1000},
+        {"id": "e2", "node": "B", "timestamp": 1005},
+        {"id": "e3", "node": "B", "timestamp": 1010},
+    ]
+    results = [
+        client.post(
+            "/api/v1/events/window-peak",
+            json=_window_payload(events=order, window={"start": 990, "end": 997}),
+        ).json()
+        for order in [events, events[::-1], [events[1], events[2], events[0]]]
+    ]
+    for r in results[1:]:
+        assert r["selected_event_ids"] == results[0]["selected_event_ids"] == ["e1", "e2"]
+        assert r["offsets"] == results[0]["offsets"]
+
+
+def test_window_peak_empty_events_returns_zero():
+    payload = _window_payload(
+        observations=[{"id": "o1", "source": "A", "target": "B", "min": 1, "max": 5}],
+        events=[],
+        window={"start": 0, "end": 10},
+    )
+    data = client.post("/api/v1/events/window-peak", json=payload).json()
+    assert data["status"] == "ok"
+    assert data["max_in_window"] == 0
+    assert data["selected_event_ids"] == []
+    offsets = {o["node"]: o["offset"] for o in data["offsets"]}
+    assert set(offsets) == {"A", "B"}
+    assert 1 <= offsets["B"] - offsets["A"] <= 5
+
+
+def test_window_peak_base_contradiction_returns_cycle():
+    payload = _window_payload(
+        observations=[
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+            {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4},
+        ],
+        events=[{"id": "e1", "node": "B", "timestamp": 100}],
+        window={"start": 90, "end": 110},
+    )
+    resp = client.post("/api/v1/events/window-peak", json=payload)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "base_contradiction"
+    assert data["max_in_window"] is None
+    assert data["selected_event_ids"] == []
+    assert data["offsets"] is None
+    diag = data["diagnosis"]
+    assert diag["feasible"] is False
+    assert diag["cycle"]["accumulated_bound"] == -3.0
+    assert diag["cycle"]["contradiction"] == "0 <= -3.0"
+
+
+def test_window_peak_event_node_merged_into_offsets():
+    # Z 只出现在事件中：并入求解节点集，见证偏移须覆盖它
+    payload = _window_payload(
+        observations=[],
+        events=[{"id": "e1", "node": "Z", "timestamp": 7}],
+        window={"start": 5, "end": 10},
+    )
+    data = client.post("/api/v1/events/window-peak", json=payload).json()
+    assert data["max_in_window"] == 1
+    offsets = {o["node"]: o["offset"] for o in data["offsets"]}
+    assert set(offsets) == {"A", "Z"}
+    assert 5 <= 7 - offsets["Z"] <= 10
+
+
+def test_window_peak_offsets_cover_explicit_nodes_and_satisfy_observations():
+    payload = _window_payload(
+        nodes=["A", "B", "C"],
+        observations=[
+            {"id": "o1", "source": "A", "target": "B", "min": 1, "max": 5},
+            {"id": "o2", "source": "B", "target": "C", "min": 2, "max": 4},
+        ],
+        events=[{"id": "e1", "node": "C", "timestamp": 100}],
+        window={"start": 90, "end": 200},
+    )
+    data = client.post("/api/v1/events/window-peak", json=payload).json()
+    assert data["selected_event_ids"] == ["e1"]
+    offsets = {o["node"]: o["offset"] for o in data["offsets"]}
+    assert set(offsets) == {"A", "B", "C"}
+    assert offsets["A"] == 0.0
+    assert 1 <= offsets["B"] - offsets["A"] <= 5
+    assert 2 <= offsets["C"] - offsets["B"] <= 4
+    assert 90 <= 100 - offsets["C"] <= 200
+
+
+def test_window_peak_name_echoed():
+    payload = _window_payload(name="peak-1")
+    data = client.post("/api/v1/events/window-peak", json=payload).json()
+    assert data["name"] == "peak-1"
+
+
+def test_window_peak_too_many_events_rejected():
+    payload = _window_payload(
+        events=[
+            {"id": f"e{i:02d}", "node": "B", "timestamp": 1000 + i}
+            for i in range(13)
+        ]
+    )
+    resp = client.post("/api/v1/events/window-peak", json=payload)
+    assert resp.status_code == 422
+
+
+def test_window_peak_duplicate_event_id_rejected():
+    payload = _window_payload(
+        events=[
+            {"id": "x", "node": "B", "timestamp": 1},
+            {"id": "x", "node": "B", "timestamp": 2},
+        ]
+    )
+    resp = client.post("/api/v1/events/window-peak", json=payload)
+    assert resp.status_code == 422
+
+
+def test_window_peak_non_finite_timestamp_rejected():
+    body = (
+        '{"reference":"A","observations":[],"window":{"start":0,"end":1},'
+        '"events":[{"id":"x","node":"B","timestamp":NaN}]}'
+    )
+    resp = client.post(
+        "/api/v1/events/window-peak",
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 422
+
+
+def test_window_peak_inverted_window_rejected():
+    payload = _window_payload(window={"start": 995, "end": 990})
+    resp = client.post("/api/v1/events/window-peak", json=payload)
+    assert resp.status_code == 422
+
+
+def test_window_peak_non_finite_window_rejected():
+    body = (
+        '{"reference":"A","observations":[],"events":[],'
+        '"window":{"start":0,"end":Infinity}}'
+    )
+    resp = client.post(
+        "/api/v1/events/window-peak",
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 422
+
+
+def test_window_peak_missing_window_rejected():
+    payload = _window_payload()
+    del payload["window"]
+    resp = client.post("/api/v1/events/window-peak", json=payload)
+    assert resp.status_code == 422
+
+
+def test_window_peak_unknown_field_rejected():
+    payload = _window_payload(bogus=1)
+    resp = client.post("/api/v1/events/window-peak", json=payload)
+    assert resp.status_code == 422
+
+
+def test_window_peak_inherited_validation_still_applies():
+    # 复用诊断请求校验：非法观测区间 / 重复观测 ID / reference 不在 nodes 中
+    base = _window_payload(events=[])
+    resp = client.post(
+        "/api/v1/events/window-peak",
+        json=base | {"observations": [
+            {"id": "o", "source": "A", "target": "B", "min": 9, "max": 1}
+        ]},
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        "/api/v1/events/window-peak",
+        json=base | {"observations": [
+            {"id": "x", "source": "A", "target": "B", "min": 0, "max": 1},
+            {"id": "x", "source": "B", "target": "A", "min": 0, "max": 1},
+        ]},
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        "/api/v1/events/window-peak",
+        json=base | {"reference": "Z", "nodes": ["A", "B"]},
+    )
+    assert resp.status_code == 422

@@ -49,6 +49,16 @@
 校准观测中选子集：组合必须保持系统可行（含矛盾的组合不可选），且使各
 目标节点相对参考节点的上下界均有限、宽度不超过给定上限。答案按
 (总成本, 条数, ID 序列字典序) 唯一确定。
+
+窗口峰值
+--------
+``plan_window_peak`` 在参考节点偏移为 0 的约定下，把「事件 e 落入真实
+时间窗口 [start, end]」翻译成两条差分约束边（事件节点相对参考节点的
+偏移被夹在一个区间内），与观测边合并后直接复用负环检测判定一组事件
+能否同时入窗。按 (事件数最多, 排序后 ID 序列字典序最小) 枚举至多
+2^12 个子集确定选中集合，再以零超源最短路求出一组覆盖全部节点、
+满足全部观测的可行偏移作为见证；选中集合的最大性保证见证中入窗事件
+恰为所选集合。
 """
 
 from __future__ import annotations
@@ -84,6 +94,15 @@ class CalibrationCandidate(Observation):
     """一条带成本的候选校准观测：成本为非负整数。"""
 
     cost: int = 0
+
+
+@dataclass(frozen=True)
+class WindowEvent:
+    """一条事件：真实时间 = 本地时间戳 timestamp - 发生节点的时钟偏移。"""
+
+    id: str
+    node: str
+    timestamp: float
 
 
 def _norm(value: float) -> float:
@@ -597,3 +616,133 @@ def plan_calibration(
         return None
     _, _, ids, chosen = best
     return ids, best[0], chosen
+
+
+# ---------------------------------------------------------------------------
+# 窗口峰值
+# ---------------------------------------------------------------------------
+
+
+def _window_edges(
+    event: WindowEvent, reference: str, start: float, end: float
+) -> List[Edge]:
+    """把「事件落入窗口 [start, end]」展开为两条差分约束边。
+
+    约定参考节点偏移为 0，事件 e（节点 n、本地时间戳 t）入窗当且仅当::
+
+        start <= t - x_n <= end
+        ⇔  x_n - x_reference <= t - start   (边 reference -> n)
+        且 x_reference - x_n <= end - t     (边 n -> reference)
+
+    窗口边只用于子集可行性检测与见证求解，不会出现在任何对外输出的
+    证据链或矛盾环中。
+    """
+    return [
+        Edge(
+            u=reference,
+            v=event.node,
+            weight=_norm(event.timestamp - start),
+            observation_id=event.id,
+            kind="window_upper",
+            bound=start,
+        ),
+        Edge(
+            u=event.node,
+            v=reference,
+            weight=_norm(end - event.timestamp),
+            observation_id=event.id,
+            kind="window_lower",
+            bound=end,
+        ),
+    ]
+
+
+def _feasible_potentials(
+    edges: Sequence[Edge], nodes: Sequence[str], reference: str
+) -> dict:
+    """求一组满足全部差分约束的势（偏移），并使参考节点偏移为 0。
+
+    以全零距离初始化跑 Bellman-Ford（等价于从零权超源出发），收敛后
+    对所有边 u->v 均有 dist[v] <= dist[u] + w；再整体平移使参考节点
+    取 0——差分约束在平移下不变。调用方须保证系统可行（无负环）。
+    """
+    dist = {v: 0.0 for v in nodes}
+    for _ in range(len(nodes)):
+        updated = False
+        for e in edges:
+            nd = dist[e.u] + e.weight
+            if nd < dist[e.v]:
+                dist[e.v] = nd
+                updated = True
+        if not updated:
+            break
+    shift = dist[reference]
+    return {v: _norm(dist[v] - shift) for v in nodes}
+
+
+def plan_window_peak(
+    nodes: Sequence[str],
+    reference: str,
+    observations: Sequence[Observation],
+    events: Sequence[WindowEvent],
+    start: float,
+    end: float,
+) -> Tuple[List[str], dict]:
+    """求可同时落入真实时间窗口 [start, end] 的最大事件集合及偏移见证。
+
+    事件 e（节点 n、本地时间戳 t）的真实时间为 ``t - x_n``（参考节点偏移
+    为 0），入窗 ⇔ ``x_n ∈ [t - end, t - start]``，即两条差分约束边；
+    与观测边合并后复用负环检测即可判定一组事件能否同时入窗。
+
+    选中集合按 **(事件数最多, 排序后事件 ID 序列字典序最小)** 唯一确定：
+    按条数从多到少、同条数按 ID 字典序枚举，首个可行子集即答案。事件
+    至多 12 条，最坏枚举 2^12 = 4096 个子集；空事件列表直接返回空选择。
+
+    返回 ``(selected_ids, offsets)``：
+
+    * ``selected_ids``：选中事件 ID（字典序排列）；
+    * ``offsets``：``{node: offset}``，覆盖 ``nodes ∪ 事件节点``，满足全部
+      观测且参考节点为 0。选中集合的最大性保证该见证中入窗事件恰为所选
+      集合——若某未选事件在此见证中也入窗，则它本可加入选中集合，
+      与事件数最多矛盾。
+
+    调用方须保证基础观测本身可行（与 ``plan_calibration`` 同一约定）。
+    """
+    # 事件节点并入求解节点集：即使事件节点不出现在任何观测中，
+    # 见证偏移也必须覆盖它。
+    all_nodes = set(nodes)
+    for e in events:
+        all_nodes.add(e.node)
+    ordered_nodes = sorted(all_nodes)
+
+    base_edges = _build_edges(observations)
+    ordered_events = sorted(events, key=lambda e: e.id)
+    window_edges = {
+        e.id: _window_edges(e, reference, start, end) for e in ordered_events
+    }
+
+    def feasible(combo: Sequence[WindowEvent]) -> bool:
+        """被选事件的同时入窗约束 + 全部观测是否仍可行（无负环）。"""
+        edges = list(base_edges)
+        for e in combo:
+            edges.extend(window_edges[e.id])
+        return _extract_negative_cycle(edges, ordered_nodes) is None
+
+    # combinations 在按 ID 排序的输入上即按 ID 序列字典序产出组合，
+    # 因此同条数下第一个可行组合就是字典序最小者。
+    chosen: List[WindowEvent] = []
+    for k in range(len(ordered_events), 0, -1):
+        hit: Optional[Tuple[WindowEvent, ...]] = None
+        for combo in itertools.combinations(ordered_events, k):
+            if feasible(combo):
+                hit = combo
+                break
+        if hit is not None:
+            chosen = list(hit)
+            break
+
+    edges = list(base_edges)
+    for e in chosen:
+        edges.extend(window_edges[e.id])
+    offsets = _feasible_potentials(edges, ordered_nodes, reference)
+    return [e.id for e in chosen], offsets

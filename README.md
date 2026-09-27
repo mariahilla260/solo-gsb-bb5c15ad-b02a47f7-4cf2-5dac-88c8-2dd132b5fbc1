@@ -15,7 +15,11 @@
 5. **校准方案**：基础观测可行时，从至多 12 条带非负整数成本的候选校准观测中，
    选择使各目标节点相对参考节点的界宽达标的**总成本最小子集**
    （同成本先比条数、再比 ID 序列字典序），返回选中 ID、总成本与加入后的诊断；
-6. 提供 **批量诊断接口**，结果按提交下标稳定返回。
+6. **窗口峰值**：在「真实时间 = 本地时间戳 − 节点偏移、参考节点偏移为 0」的
+   约定下，求**可同时落入给定真实时间窗口的最大事件集合**（至多 12 条事件，
+   并列时选排序后事件 ID 序列字典序最小者），并返回一组覆盖全部节点、
+   满足全部观测的**可行偏移见证**——该见证下入窗事件恰为所选集合；
+7. 提供 **批量诊断接口**，结果按提交下标稳定返回。
 
 算法：差分约束图 + Bellman-Ford（超源初始化检测负环、前驱指针回卷提取矛盾环），
 纯 Python 标准实现，无外部服务依赖。
@@ -494,6 +498,129 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/calibration-plan \
 }
 ```
 
+### `POST /api/v1/events/window-peak` — 窗口峰值
+
+在诊断请求的基础上另收**至多 12 条事件**与一个**有限闭区间窗口**，求在
+满足全部观测的**同一组偏移**下，可同时落入窗口的最大事件数及对应见证。
+
+约定：**真实时间 = 本地时间戳 − 节点偏移**，**参考节点偏移恒为 0**。事件
+`e`（节点 `n`、本地时间戳 `t`）入窗当且仅当
+`start ≤ t − x_n ≤ end`，即 `x_n ∈ [t − end, t − start]`。
+
+请求体沿用单条诊断的全部字段（`reference` / `observations` / `nodes` / `name`），
+另增加：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `events` | array | 否 | 事件列表，至多 12 条，默认空数组 |
+| `events[].id` | string | 是 | 事件唯一 ID（事件间不可重复） |
+| `events[].node` | string | 是 | 事件发生的时钟节点（自动并入求解节点集） |
+| `events[].timestamp` | number | 是 | 节点本地时间戳（毫秒），须为有限数值 |
+| `window` | object | 是 | 真实时间窗口 |
+| `window.start` / `window.end` | number | 是 | 有限闭区间端点，须满足 `start ≤ end` |
+
+响应字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `status` | string | `ok` / `base_contradiction` |
+| `max_in_window` | integer/null | 可同时入窗的最大事件数；`base_contradiction` 时为 `null` |
+| `selected_event_ids` | string[] | 选中事件 ID（字典序）；`base_contradiction` 时为空 |
+| `offsets` | array/null | 覆盖全部求解节点的可行偏移见证（`{node, offset}`，按节点字典序，参考节点恒为 0）；`base_contradiction` 时为 `null` |
+| `diagnosis` | object/null | `base_contradiction` 时为基础观测的矛盾诊断（含矛盾环）；`ok` 时为 `null` |
+
+语义与保证：
+
+- 选中集合按 **(事件数最多, 排序后事件 ID 序列字典序最小)** 唯一确定，
+  与事件的提交顺序无关；
+- `offsets` 满足全部观测（含参考节点偏移为 0），且该见证下**入窗事件
+  恰为所选集合**——由最大性保证：若某未选事件也能入窗，它本可加入
+  选中集合，与事件数最多矛盾；
+- 空事件列表直接返回 `max_in_window = 0`（`offsets` 仍给出覆盖全部
+  节点的可行偏移）；
+- 基础观测本身矛盾时不做事件求解，返回 `status="base_contradiction"`
+  及与单条诊断一致的矛盾环。
+
+#### 共享时钟约束导致事件不能同时入窗（示例）
+
+两条事件都发生在节点 `B` 上，共享同一个时钟偏移 `x_B`（`x_B − x_A ∈ [0,100]`）：
+`e1` 入窗 ⇔ `x_B ∈ [5,10]`，`e2` 入窗 ⇔ `x_B ∈ [15,20]`，两个区间不相交，
+因此二者**各自都能入窗、却不能同时入窗**，最多只能选 1 条：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/events/window-peak \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "sync", "source": "A", "target": "B", "min": 0, "max": 100}
+    ],
+    "events": [
+      {"id": "e1", "node": "B", "timestamp": 1000},
+      {"id": "e2", "node": "B", "timestamp": 1010}
+    ],
+    "window": {"start": 990, "end": 995}
+  }'
+```
+
+```json
+{
+  "name": null,
+  "status": "ok",
+  "max_in_window": 1,
+  "selected_event_ids": ["e1"],
+  "offsets": [
+    {"node": "A", "offset": 0.0},
+    {"node": "B", "offset": 5.0}
+  ],
+  "diagnosis": null
+}
+```
+
+并列的 `{e1}` 与 `{e2}` 中选择 ID 字典序最小的 `e1`。见证 `x_B = 5` 下：
+`e1` 真实时间 `1000 − 5 = 995` 落入 `[990, 995]`，`e2` 真实时间
+`1010 − 5 = 1005` 在窗口之外——入窗事件恰为所选集合。
+
+#### 基础观测矛盾（示例）
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/events/window-peak \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+      {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4}
+    ],
+    "events": [{"id": "e1", "node": "B", "timestamp": 100}],
+    "window": {"start": 90, "end": 110}
+  }'
+```
+
+```json
+{
+  "name": null,
+  "status": "base_contradiction",
+  "max_in_window": null,
+  "selected_event_ids": [],
+  "offsets": null,
+  "diagnosis": {
+    "feasible": false,
+    "name": null,
+    "cycle": {
+      "steps": [
+        {"observation_id": "o2", "from": "A", "to": "B",
+         "constraint": "lower", "weight": -3.0, "bound": 3.0},
+        {"observation_id": "o1", "from": "B", "to": "A",
+         "constraint": "lower", "weight": 0.0, "bound": 0.0}
+      ],
+      "accumulated_bound": -3.0,
+      "contradiction": "0 <= -3.0"
+    }
+  }
+}
+```
+
 ### `POST /api/v1/diagnose/batch` — 批量诊断
 
 请求体 `{"diagnoses": [ <单条请求>, ... ]}`（至少 1 条）。每条可带 `name`，
@@ -522,7 +649,9 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/batch \
 非法区间（`min > max`）、重复观测 ID、`reference` 不在 `nodes` 中等请求问题返回
 HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` 为空或目标重复、
 `max_width < 0`、候选超过 12 条、候选成本为负或非整数、候选 ID 彼此重复或与
-基础观测 ID 冲突、候选区间非法等。
+基础观测 ID 冲突、候选区间非法等。窗口峰值接口还会拒绝：`events` 超过 12 条、
+事件 ID 重复、事件时间戳非有限数值（NaN/±inf）、窗口端点非有限数值或
+`start > end`、缺少 `window` 等。
 
 ---
 
@@ -544,7 +673,15 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
   集合即唯一修复建议；删除全部观测必然可行，因此上限不小于观测总数时必有解；
 - **校准**：候选至多 12 条，穷举至多 2^12 = 4096 个子集；每个子集先做负环
   检测（矛盾组合不可选），可行时再跑双向最短路核对各目标界宽；按
-  (总成本, 条数, ID 序列字典序) 比较，答案与候选提交顺序无关。
+  (总成本, 条数, ID 序列字典序) 比较，答案与候选提交顺序无关；
+- **窗口峰值**：事件 `e`（节点 `n`、本地时间戳 `t`）入窗 ⇔
+  `x_n ∈ [t − end, t − start]`（参考节点偏移为 0），展开为
+  `reference -> n`（权 `t − start`）与 `n -> reference`（权 `end − t`）两条
+  差分约束边，与观测边合并后复用同一负环检测判定一组事件能否同时入窗；
+  按 (事件数最多, ID 序列字典序最小) 枚举至多 2^12 个子集确定选中集合；
+  见证偏移由零超源最短路（可行势）整体平移至参考节点为 0 得到，
+  覆盖「显式 `nodes` ∪ `reference` ∪ 观测端点 ∪ 事件节点」，
+  且由最大性保证入窗事件恰为所选集合。
 
 结果顺序的确定性保证：
 
@@ -559,9 +696,9 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
 
 ```
 app/
-  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/health
+  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/api/v1/events/window-peak、/health
   models.py    # 请求/响应 Pydantic 模型与入参校验
-  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准方案
+  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准方案、窗口峰值求解与可行偏移见证
 tests/         # 算法层与 HTTP 接口测试
 Dockerfile
 docker-compose.yml

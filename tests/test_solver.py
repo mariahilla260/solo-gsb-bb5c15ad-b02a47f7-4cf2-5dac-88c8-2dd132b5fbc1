@@ -5,8 +5,10 @@ import itertools
 from app.solver import (
     CalibrationCandidate,
     Observation,
+    WindowEvent,
     diagnose,
     plan_calibration,
+    plan_window_peak,
     suggest_repair,
 )
 
@@ -551,3 +553,101 @@ def test_calibration_independent_of_submission_order():
     for plan in plans[1:]:
         assert (plan[0], plan[1]) == (plans[0][0], plans[0][1])
     assert plans[0][0] == ["cal-b", "cal-c"]
+
+
+# ---------------------------------------------------------------------------
+# 窗口峰值
+# ---------------------------------------------------------------------------
+
+
+def _event(id_, node, ts):
+    return WindowEvent(id=id_, node=node, timestamp=ts)
+
+
+def _in_window(offsets, event, start, end):
+    return start <= event.timestamp - offsets[event.node] <= end
+
+
+def test_window_peak_all_events_fit():
+    # e1 入窗 ⇔ x_B ∈ [5,10]；e2 入窗 ⇔ x_B ∈ [8,13]；交集 [8,10] 非空
+    obs = [_obs("sync", "A", "B", 0, 100)]
+    events = [_event("e1", "B", 1000), _event("e2", "B", 1003)]
+    ids, offsets = plan_window_peak(["A", "B"], "A", obs, events, 990, 995)
+    assert ids == ["e1", "e2"]
+    assert offsets["A"] == 0.0
+    assert all(_in_window(offsets, e, 990, 995) for e in events)
+
+
+def test_window_peak_shared_clock_cannot_cooccur():
+    # 两条事件共享同一时钟偏移 x_B：e1 ⇔ x_B∈[5,10]，e2 ⇔ x_B∈[15,20]
+    obs = [_obs("sync", "A", "B", 0, 100)]
+    events = [_event("e1", "B", 1000), _event("e2", "B", 1010)]
+    ids, offsets = plan_window_peak(["A", "B"], "A", obs, events, 990, 995)
+    # 并列 {e1} 与 {e2}，选 ID 字典序最小者
+    assert ids == ["e1"]
+    by_id = {e.id: e for e in events}
+    assert _in_window(offsets, by_id["e1"], 990, 995)
+    assert not _in_window(offsets, by_id["e2"], 990, 995)
+
+
+def test_window_peak_lex_tie_break_and_order_independence():
+    # 三事件两两可同窗、三者不可同窗 -> 最大 2 条，选字典序最小对 [e1, e2]
+    obs = [_obs("sync", "A", "B", 0, 100)]
+    events = [
+        _event("e1", "B", 1000),
+        _event("e2", "B", 1005),
+        _event("e3", "B", 1010),
+    ]
+    for perm in itertools.permutations(events):
+        ids, offsets = plan_window_peak(["A", "B"], "A", obs, list(perm), 990, 997)
+        assert ids == ["e1", "e2"]
+        # 见证中入窗事件恰为所选集合
+        in_window = [e.id for e in events if _in_window(offsets, e, 990, 997)]
+        assert in_window == ["e1", "e2"]
+
+
+def test_window_peak_empty_events_returns_empty_selection():
+    obs = [_obs("o1", "A", "B", 1, 5)]
+    ids, offsets = plan_window_peak(["A", "B"], "A", obs, [], 0, 10)
+    assert ids == []
+    # 见证仍覆盖全部节点且满足全部观测
+    assert set(offsets) == {"A", "B"}
+    assert offsets["A"] == 0.0
+    assert 1 <= offsets["B"] - offsets["A"] <= 5
+
+
+def test_window_peak_event_node_merged_into_node_set():
+    # Z 只出现在事件中，也必须进入求解节点集并出现在见证里
+    ids, offsets = plan_window_peak(["A"], "A", [], [_event("e1", "Z", 7)], 5, 10)
+    assert ids == ["e1"]
+    assert set(offsets) == {"A", "Z"}
+    assert 5 <= 7 - offsets["Z"] <= 10
+
+
+def test_window_peak_event_on_reference_has_fixed_real_time():
+    # 参考节点偏移恒为 0：t=5 恒在 [0,10] 内可选，t=50 永不可选
+    events = [_event("in", "A", 5), _event("out", "A", 50)]
+    ids, offsets = plan_window_peak(["A"], "A", [], events, 0, 10)
+    assert ids == ["in"]
+    assert offsets["A"] == 0.0
+
+
+def test_window_peak_witness_satisfies_all_observations():
+    obs = [_obs("o1", "A", "B", 1, 5), _obs("o2", "B", "C", 2, 4)]
+    events = [_event("e1", "C", 100)]
+    ids, offsets = plan_window_peak(["A", "B", "C"], "A", obs, events, 90, 200)
+    assert ids == ["e1"]
+    assert 1 <= offsets["B"] - offsets["A"] <= 5
+    assert 2 <= offsets["C"] - offsets["B"] <= 4
+    assert 90 <= 100 - offsets["C"] <= 200
+
+
+def test_window_peak_rigid_link_propagates_constraint():
+    # x_C - x_B = 5（刚性）：e1 在 B、e2 在 C，二者不能同时入窗
+    obs = [_obs("link", "B", "C", 5, 5), _obs("sync", "A", "B", 0, 100)]
+    events = [_event("e1", "B", 1000), _event("e2", "C", 1016)]
+    ids, offsets = plan_window_peak(["A", "B", "C"], "A", obs, events, 990, 995)
+    # e1 ⇔ x_B∈[5,10]；e2 ⇔ x_C∈[21,26] ⇔ x_B∈[16,21]；区间不相交
+    assert len(ids) == 1
+    in_window = [e.id for e in events if _in_window(offsets, e, 990, 995)]
+    assert in_window == ids

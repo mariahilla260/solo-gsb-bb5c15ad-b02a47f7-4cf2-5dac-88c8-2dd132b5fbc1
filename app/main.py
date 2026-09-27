@@ -1,10 +1,14 @@
-"""FastAPI 入口：单条诊断、批量诊断、修复建议与健康检查。"""
+"""FastAPI 入口：单条诊断、批量诊断、修复建议、校准方案、窗口峰值与健康检查。"""
 
 from __future__ import annotations
 
+import math
 from typing import List
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from .models import (
     BatchDiagnosisRequest,
@@ -18,15 +22,20 @@ from .models import (
     DiagnosisResponse,
     FeasibleDiagnosis,
     InfeasibleDiagnosis,
+    NodeOffset,
     RepairRequest,
     RepairResponse,
+    WindowPeakRequest,
+    WindowPeakResponse,
     collect_nodes,
 )
 from .solver import (
     CalibrationCandidate,
     Observation,
+    WindowEvent,
     diagnose,
     plan_calibration,
+    plan_window_peak,
     suggest_repair,
 )
 
@@ -38,10 +47,37 @@ app = FastAPI(
         "可行时给出相对参考节点的最紧上下界及对应的证据链"
         "（lower_proof / upper_proof），不可行时返回稳定的矛盾环，"
         "并可进一步给出最小观测删除集合的修复建议；"
-        "还可从带成本的候选观测中规划满足目标界宽的最小成本校准方案。"
+        "还可从带成本的候选观测中规划满足目标界宽的最小成本校准方案；"
+        "另可在真实时间窗口下求同时入窗的最大事件集合及可行偏移见证。"
     ),
-    version="1.3.0",
+    version="1.4.0",
 )
+
+
+def _sanitize_error_value(value):
+    """把校验错误详情中的非有限浮点（NaN/±inf）替换为 None。
+
+    FastAPI 0.115 的默认 422 处理器在序列化含 NaN/inf 的 ``input`` 字段时
+    会因 ``allow_nan=False`` 抛出 ValueError，使非法输入得到 500 而非 422。
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {k: _sanitize_error_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_error_value(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """与默认处理器一致地返回 422，但先清洗非有限浮点避免序列化崩溃。"""
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _sanitize_error_value(jsonable_encoder(exc.errors()))},
+    )
 
 
 def _to_observation(raw) -> Observation:
@@ -243,4 +279,60 @@ def diagnose_calibration_plan(request: CalibrationPlanRequest) -> CalibrationPla
         selected_observation_ids=selected_ids,
         total_cost=total_cost,
         diagnosis=_diagnosis_model(request.name, final_result),
+    )
+
+
+@app.post(
+    "/api/v1/events/window-peak",
+    response_model=WindowPeakResponse,
+    tags=["events"],
+)
+def events_window_peak(request: WindowPeakRequest) -> WindowPeakResponse:
+    """窗口峰值：求可同时落入真实时间窗口的最大事件集合与可行偏移见证。
+
+    真实时间 = 本地时间戳 − 节点偏移，参考节点偏移为 0。在满足全部观测的
+    同一组偏移下，使落入窗口 [start, end] 的事件数最多；并列时选排序后
+    事件 ID 序列字典序最小者。事件节点并入求解节点集。基础观测矛盾时
+    返回 status=base_contradiction 及现有矛盾环，不做事件求解。
+    """
+    observations = [_to_observation(o) for o in request.observations]
+    # 节点宇宙：显式 nodes ∪ reference ∪ 观测端点 ∪ 事件节点
+    nodes = request.effective_nodes()
+
+    base_result = diagnose(
+        nodes=nodes,
+        reference=request.reference,
+        observations=observations,
+    )
+    if not base_result["feasible"]:
+        return WindowPeakResponse(
+            name=request.name,
+            status="base_contradiction",
+            max_in_window=None,
+            selected_event_ids=[],
+            offsets=None,
+            diagnosis=_diagnosis_model(request.name, base_result),
+        )
+
+    selected_ids, offsets = plan_window_peak(
+        nodes=nodes,
+        reference=request.reference,
+        observations=observations,
+        events=[
+            WindowEvent(id=e.id, node=e.node, timestamp=e.timestamp)
+            for e in request.events
+        ],
+        start=request.window.start,
+        end=request.window.end,
+    )
+    return WindowPeakResponse(
+        name=request.name,
+        status="ok",
+        max_in_window=len(selected_ids),
+        selected_event_ids=selected_ids,
+        offsets=[
+            NodeOffset(node=node, offset=offsets[node])
+            for node in sorted(offsets)
+        ],
+        diagnosis=None,
     )
